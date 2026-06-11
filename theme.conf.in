@@ -1,0 +1,10 @@
+# bar theme template - rendered by toggle_theme.sh to ~/.config/bar/theme.conf
+# Mirrors eww.scss.in: bg=base, fg=text, ws numbers=overlay1,
+# focused pill=accent/accent_fg, urgent pill=red.
+bg=${base}
+bg_alpha=1.00
+fg=${text}
+ws_num_fg=${overlay1}
+focused_bg=${accent}
+focused_fg=${accent_fg}
+urgent_bg=${red}
