@@ -5,8 +5,8 @@ XDG_XML ?= /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
 PREFIX ?= $(HOME)/.local
 
 CC      = gcc
-CFLAGS  = -O2 -Wall $(shell pkg-config --cflags wayland-client cairo pango pangocairo libcjson)
-LIBS    = $(shell pkg-config --libs   wayland-client cairo pango pangocairo libcjson)
+CFLAGS  = -O2 -Wall $(shell pkg-config --cflags wayland-client cairo pango pangocairo libcjson librsvg-2.0)
+LIBS    = $(shell pkg-config --libs   wayland-client cairo pango pangocairo libcjson librsvg-2.0)
 
 PROTO_SRC = wlr-layer-shell-unstable-v1-protocol.c xdg-shell-protocol.c
 PROTO_HDR = wlr-layer-shell-unstable-v1-client-protocol.h xdg-shell-client-protocol.h

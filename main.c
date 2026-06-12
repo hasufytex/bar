@@ -3,7 +3,7 @@
  * left : every workspace: number + icons of apps on it (focused = accent pill)
  * right: ipv4   ram avail   CPU%   date   time (1s tick)
  *
- * deps: wayland-client, cairo, pango, pangocairo, cjson
+ * deps: wayland-client, cairo, pango, pangocairo, cjson, librsvg-2.0
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -28,6 +28,7 @@
 
 #include <cairo/cairo.h>
 #include <cjson/cJSON.h>
+#include <librsvg/rsvg.h>
 #include <pango/pangocairo.h>
 #include <wayland-client.h>
 
@@ -242,6 +243,26 @@ static cairo_surface_t *try_png(const char *path) {
   return s;
 }
 
+static cairo_surface_t *try_svg(const char *path) {
+  if (access(path, F_OK) != 0)
+    return NULL;
+  RsvgHandle *h = rsvg_handle_new_from_file(path, NULL);
+  if (!h)
+    return NULL;
+  cairo_surface_t *s =
+      cairo_image_surface_create(CAIRO_FORMAT_ARGB32, ICON_SIZE, ICON_SIZE);
+  cairo_t *cr = cairo_create(s);
+  RsvgRectangle vp = {0, 0, ICON_SIZE, ICON_SIZE};
+  rsvg_handle_render_document(h, cr, &vp, NULL);
+  cairo_destroy(cr);
+  g_object_unref(h);
+  if (cairo_surface_status(s) != CAIRO_STATUS_SUCCESS) {
+    cairo_surface_destroy(s);
+    return NULL;
+  }
+  return s;
+}
+
 static cairo_surface_t *icon_lookup(const char *app_id) {
   char icon[256], path[512];
   desktop_icon_name(app_id, icon, sizeof(icon));
@@ -255,11 +276,24 @@ static cairo_surface_t *icon_lookup(const char *app_id) {
       "/usr/share/icons/hicolor/64x64/apps/%s.png",
       "/usr/share/icons/hicolor/32x32/apps/%s.png",
       "/usr/share/icons/hicolor/128x128/apps/%s.png",
+      "/usr/share/icons/hicolor/256x256/apps/%s.png",
+      "/usr/share/icons/hicolor/512x512/apps/%s.png", /* e.g. zed ships only this */
       "/usr/share/pixmaps/%s.png",
   };
   for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
     snprintf(path, sizeof(path), dirs[i], icon);
     cairo_surface_t *s = try_png(path);
+    if (s)
+      return s;
+  }
+
+  const char *svg_dirs[] = {
+      "/usr/share/icons/hicolor/scalable/apps/%s.svg",
+      "/usr/share/pixmaps/%s.svg",
+  };
+  for (size_t i = 0; i < sizeof(svg_dirs) / sizeof(svg_dirs[0]); i++) {
+    snprintf(path, sizeof(path), svg_dirs[i], icon);
+    cairo_surface_t *s = try_svg(path);
     if (s)
       return s;
   }
