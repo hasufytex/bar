@@ -1,6 +1,6 @@
 /* bar - minimal sway status bar prototype
  *
- * left : every workspace: number + icons of apps on it (focused = accent pill)
+ * left : every workspace: number + icons of apps on it (focused number = white)
  * right: ipv4   ram avail   CPU%   date   time (1s tick)
  *
  * deps: wayland-client, cairo, pango, pangocairo, cjson, librsvg-2.0
@@ -28,17 +28,19 @@
 
 #include <cairo/cairo.h>
 #include <cjson/cJSON.h>
+#include <gio/gdesktopappinfo.h>
 #include <librsvg/rsvg.h>
 #include <pango/pangocairo.h>
 #include <wayland-client.h>
 
+#include "buffers.h"
+#include "ipc.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
 #define BAR_HEIGHT 34
 #define ICON_SIZE 22
 #define MAX_APPS 32
-#define RAM_CACHE_MAX 20
-#define FONT "JetBrainsMono Nerd Font 14" /* follows eww.scss */
+#define FONT "Liberation Mono 14"
 
 /* ---------------- wayland globals ---------------- */
 
@@ -50,8 +52,10 @@ static struct wl_seat *seat;
 static struct wl_pointer *pointer;
 static struct wl_surface *surface;
 static struct zwlr_layer_surface_v1 *layer_surface;
-static struct wl_buffer *buffer;
-static void *shm_data;
+static BarBuffer buffers[2];
+static struct wl_callback *frame;
+static bool dirty = true, running = true;
+static uint32_t bar_height = BAR_HEIGHT;
 
 static uint32_t bar_width = 0;
 static bool configured = false;
@@ -59,7 +63,8 @@ static bool configured = false;
 static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
                             const char *iface, uint32_t ver) {
   if (!strcmp(iface, wl_compositor_interface.name))
-    compositor = wl_registry_bind(reg, name, &wl_compositor_interface, 4);
+    compositor = wl_registry_bind(reg, name, &wl_compositor_interface,
+                                  ver < 4 ? ver : 4);
   else if (!strcmp(iface, wl_shm_interface.name))
     shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
   else if (!strcmp(iface, zwlr_layer_shell_v1_interface.name))
@@ -81,155 +86,103 @@ static void layer_configure(void *data, struct zwlr_layer_surface_v1 *ls,
   zwlr_layer_surface_v1_ack_configure(ls, serial);
   if (w > 0)
     bar_width = w;
+  if (!bar_width)
+    bar_width = 1920;
+  if (h > 0)
+    bar_height = h;
   configured = true;
+  dirty = true;
 }
 static void layer_closed(void *data, struct zwlr_layer_surface_v1 *ls) {
-  exit(0);
+  running = false;
 }
 static const struct zwlr_layer_surface_v1_listener layer_listener = {
     .configure = layer_configure,
     .closed = layer_closed,
 };
 
-/* ---------------- theme ----------------
- * Colors come from ~/.config/bar/theme.conf, rendered from theme.conf.in by
- * toggle_theme.sh (the single source of truth for OS theming). The file is
- * re-read whenever its mtime changes, so a theme toggle restyles the running
- * bar on the next redraw. Fallbacks below are catppuccin mocha. */
+/* ---------------- appearance ----------------
+ * Match foot's Liberation Mono:size=14 and default colors directly. */
 
 typedef struct {
   double r, g, b;
 } Color;
 
-static Color th_bg, th_fg, th_ws_num, th_focused_bg, th_focused_fg,
-    th_urgent_bg;
-static double th_bg_alpha = 1.0;
-static char theme_path[512];
-
-static void parse_hex(const char *s, Color *c) {
-  unsigned r, g, b;
-  if (s[0] == '#')
-    s++;
-  if (sscanf(s, "%2x%2x%2x", &r, &g, &b) != 3)
-    return;
-  c->r = r / 255.0;
-  c->g = g / 255.0;
-  c->b = b / 255.0;
-}
-
-static void load_theme(void) {
-  parse_hex("#1e1e2e", &th_bg);
-  parse_hex("#cdd6f4", &th_fg);
-  parse_hex("#7f849c", &th_ws_num);
-  parse_hex("#89b4fa", &th_focused_bg);
-  parse_hex("#1e1e2e", &th_focused_fg);
-  parse_hex("#f38ba8", &th_urgent_bg);
-  th_bg_alpha = 1.0;
-
-  FILE *f = fopen(theme_path, "r");
-  if (!f)
-    return;
-  char line[128], key[32], val[64];
-  while (fgets(line, sizeof(line), f)) {
-    if (sscanf(line, "%31[a-z_]=%63s", key, val) != 2)
-      continue;
-    if (!strcmp(key, "bg"))
-      parse_hex(val, &th_bg);
-    else if (!strcmp(key, "bg_alpha"))
-      th_bg_alpha = atof(val);
-    else if (!strcmp(key, "fg"))
-      parse_hex(val, &th_fg);
-    else if (!strcmp(key, "ws_num_fg"))
-      parse_hex(val, &th_ws_num);
-    else if (!strcmp(key, "focused_bg"))
-      parse_hex(val, &th_focused_bg);
-    else if (!strcmp(key, "focused_fg"))
-      parse_hex(val, &th_focused_fg);
-    else if (!strcmp(key, "urgent_bg"))
-      parse_hex(val, &th_urgent_bg);
-  }
-  fclose(f);
-}
-
-static void maybe_reload_theme(void) {
-  static time_t last_mtime;
-  struct stat st;
-  if (stat(theme_path, &st) == 0 && st.st_mtime != last_mtime) {
-    last_mtime = st.st_mtime;
-    load_theme();
-  }
-}
+static const Color bar_bg = {36 / 255.0, 36 / 255.0, 36 / 255.0};
+static const Color bar_fg = {1.0, 1.0, 1.0};
+static const Color ws_inactive_fg = {136 / 255.0, 136 / 255.0, 136 / 255.0};
 
 /* ---------------- icon cache ---------------- */
 
 typedef struct {
-  char app_id[64];
-  cairo_surface_t *surface; /* NULL allowed: caches "not found" too */
+  cairo_surface_t *surface;
+  unsigned generation;
 } IconCacheEntry;
 
-static IconCacheEntry ram_cache[RAM_CACHE_MAX];
-static int ram_cache_count = 0;
+static GHashTable *ram_cache;
+static unsigned icon_generation;
+
+static void icon_entry_free(void *data) {
+  IconCacheEntry *entry = data;
+  cairo_surface_destroy(entry->surface);
+  free(entry);
+}
 
 static bool ram_cache_get(const char *app_id, cairo_surface_t **out) {
-  for (int i = 0; i < ram_cache_count; i++) {
-    if (!strcmp(ram_cache[i].app_id, app_id)) {
-      *out = ram_cache[i].surface;
-      return true;
-    }
-  }
-  return false;
+  IconCacheEntry *entry =
+      ram_cache ? g_hash_table_lookup(ram_cache, app_id) : NULL;
+  if (!entry)
+    return false;
+  entry->generation = icon_generation;
+  *out = entry->surface;
+  return true;
 }
 
 static void ram_cache_set(const char *app_id, cairo_surface_t *s) {
-  if (ram_cache_count < RAM_CACHE_MAX) {
-    snprintf(ram_cache[ram_cache_count].app_id, 64, "%s", app_id);
-    ram_cache[ram_cache_count].surface = s;
-    ram_cache_count++;
-    return;
-  }
-  /* evict oldest (FIFO) */
-  if (ram_cache[0].surface)
-    cairo_surface_destroy(ram_cache[0].surface);
-  memmove(&ram_cache[0], &ram_cache[1],
-          sizeof(IconCacheEntry) * (RAM_CACHE_MAX - 1));
-  snprintf(ram_cache[RAM_CACHE_MAX - 1].app_id, 64, "%s", app_id);
-  ram_cache[RAM_CACHE_MAX - 1].surface = s;
+  if (!ram_cache)
+    ram_cache =
+        g_hash_table_new_full(g_str_hash, g_str_equal, g_free, icon_entry_free);
+  IconCacheEntry *entry = g_new0(IconCacheEntry, 1);
+  entry->surface = s;
+  entry->generation = icon_generation;
+  g_hash_table_replace(ram_cache, g_strdup(app_id), entry);
 }
 
-/* read Icon= from the app's .desktop file, fall back to app_id itself */
+static gboolean icon_unused(void *key, void *value, void *data) {
+  return ((IconCacheEntry *)value)->generation != icon_generation;
+}
+
+/* Resolve the desktop ID first, then StartupWMClass. GIO handles XDG data
+ * directories, user overrides, and the Desktop Entry group. The fallback
+ * catalog is loaded once; restart the bar after installing desktop entries. */
 static void desktop_icon_name(const char *app_id, char *out, size_t out_len) {
-  char path[512];
-  const char *home = getenv("HOME");
-  const char *fmts[] = {
-      "%s/.local/share/applications/%s.desktop",
-      "/usr/share/applications/%s.desktop",
-      "/usr/local/share/applications/%s.desktop",
-  };
+  static GList *apps;
+  static bool catalog_loaded;
+  char *desktop_id = g_strconcat(app_id, ".desktop", NULL);
+  GDesktopAppInfo *app = g_desktop_app_info_new(desktop_id);
+  g_free(desktop_id);
 
-  snprintf(out, out_len, "%s", app_id); /* fallback */
-
-  for (int i = 0; i < 3; i++) {
-    if (i == 0) {
-      if (!home)
-        continue;
-      snprintf(path, sizeof(path), fmts[0], home, app_id);
-    } else {
-      snprintf(path, sizeof(path), fmts[i], app_id);
+  if (!app) {
+    if (!catalog_loaded) {
+      apps = g_app_info_get_all();
+      catalog_loaded = true;
     }
-    FILE *f = fopen(path, "r");
-    if (!f)
-      continue;
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-      if (!strncmp(line, "Icon=", 5)) {
-        line[strcspn(line, "\n")] = 0;
-        snprintf(out, out_len, "%s", line + 5);
-        fclose(f);
-        return;
+    for (GList *it = apps; it; it = it->next) {
+      if (!G_IS_DESKTOP_APP_INFO(it->data))
+        continue;
+      const char *wm_class = g_desktop_app_info_get_startup_wm_class(it->data);
+      if (wm_class && !strcmp(wm_class, app_id)) {
+        app = g_object_ref(it->data);
+        break;
       }
     }
-    fclose(f);
   }
+
+  char *icon = app ? g_desktop_app_info_get_string(app, "Icon") : NULL;
+  snprintf(out, out_len, "%s", icon && *icon ? icon : app_id);
+  g_free(icon);
+  if (app)
+    g_object_unref(app);
 }
 
 static cairo_surface_t *try_png(const char *path) {
@@ -240,7 +193,24 @@ static cairo_surface_t *try_png(const char *path) {
     cairo_surface_destroy(s);
     return NULL;
   }
-  return s;
+  int width = cairo_image_surface_get_width(s);
+  int height = cairo_image_surface_get_height(s);
+  if (width <= 0 || height <= 0) {
+    cairo_surface_destroy(s);
+    return NULL;
+  }
+  cairo_surface_t *scaled =
+      cairo_image_surface_create(CAIRO_FORMAT_ARGB32, ICON_SIZE, ICON_SIZE);
+  cairo_t *cr = cairo_create(scaled);
+  double scale = (double)ICON_SIZE / (width > height ? width : height);
+  cairo_translate(cr, (ICON_SIZE - width * scale) / 2,
+                  (ICON_SIZE - height * scale) / 2);
+  cairo_scale(cr, scale, scale);
+  cairo_set_source_surface(cr, s, 0, 0);
+  cairo_paint(cr);
+  cairo_destroy(cr);
+  cairo_surface_destroy(s);
+  return scaled;
 }
 
 static cairo_surface_t *try_svg(const char *path) {
@@ -253,10 +223,10 @@ static cairo_surface_t *try_svg(const char *path) {
       cairo_image_surface_create(CAIRO_FORMAT_ARGB32, ICON_SIZE, ICON_SIZE);
   cairo_t *cr = cairo_create(s);
   RsvgRectangle vp = {0, 0, ICON_SIZE, ICON_SIZE};
-  rsvg_handle_render_document(h, cr, &vp, NULL);
+  gboolean rendered = rsvg_handle_render_document(h, cr, &vp, NULL);
   cairo_destroy(cr);
   g_object_unref(h);
-  if (cairo_surface_status(s) != CAIRO_STATUS_SUCCESS) {
+  if (!rendered || cairo_surface_status(s) != CAIRO_STATUS_SUCCESS) {
     cairo_surface_destroy(s);
     return NULL;
   }
@@ -268,8 +238,10 @@ static cairo_surface_t *icon_lookup(const char *app_id) {
   desktop_icon_name(app_id, icon, sizeof(icon));
 
   /* absolute path in Icon= */
-  if (icon[0] == '/')
-    return try_png(icon);
+  if (icon[0] == '/') {
+    cairo_surface_t *s = try_png(icon);
+    return s ? s : try_svg(icon);
+  }
 
   const char *dirs[] = {
       "/usr/share/icons/hicolor/48x48/apps/%s.png",
@@ -277,7 +249,8 @@ static cairo_surface_t *icon_lookup(const char *app_id) {
       "/usr/share/icons/hicolor/32x32/apps/%s.png",
       "/usr/share/icons/hicolor/128x128/apps/%s.png",
       "/usr/share/icons/hicolor/256x256/apps/%s.png",
-      "/usr/share/icons/hicolor/512x512/apps/%s.png", /* e.g. zed ships only this */
+      "/usr/share/icons/hicolor/512x512/apps/%s.png", /* e.g. zed ships only
+                                                         this */
       "/usr/share/pixmaps/%s.png",
   };
   for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
@@ -300,12 +273,33 @@ static cairo_surface_t *icon_lookup(const char *app_id) {
   return NULL;
 }
 
+/* A built-in window glyph keeps apps visible even without installed icons. */
+static cairo_surface_t *generic_app_icon(void) {
+  cairo_surface_t *s =
+      cairo_image_surface_create(CAIRO_FORMAT_ARGB32, ICON_SIZE, ICON_SIZE);
+  cairo_t *cr = cairo_create(s);
+  cairo_set_source_rgb(cr, 0.75, 0.75, 0.75);
+  cairo_set_line_width(cr, 1.5);
+  cairo_rectangle(cr, 3, 4, ICON_SIZE - 6, ICON_SIZE - 8);
+  cairo_move_to(cr, 3, 8);
+  cairo_line_to(cr, ICON_SIZE - 3, 8);
+  cairo_stroke(cr);
+  cairo_destroy(cr);
+  return s;
+}
+
 static cairo_surface_t *icon_get(const char *app_id) {
   cairo_surface_t *s;
   if (ram_cache_get(app_id, &s))
     return s;
   s = icon_lookup(app_id);
-  ram_cache_set(app_id, s); /* cache misses too, avoids re-walking dirs */
+  if (!s) {
+    static cairo_surface_t *fallback;
+    if (!fallback)
+      fallback = generic_app_icon();
+    s = cairo_surface_reference(fallback);
+  }
+  ram_cache_set(app_id, s);
   return s;
 }
 
@@ -318,73 +312,28 @@ static cairo_surface_t *icon_get(const char *app_id) {
 #define SWAY_GET_INPUTS 100
 #define SWAY_EVT_INPUT 21 /* event type field with the high bit masked off */
 
-static int sway_cmd_fd = -1; /* query/command socket, shared with input */
+static Ipc command_ipc = {.fd = -1}, event_ipc = {.fd = -1};
+static bool want_ws = true, want_lang = true, subscribed;
+static char pending_command[64];
 
 static int sway_connect(void) {
   const char *sock = getenv("SWAYSOCK");
-  if (!sock) {
-    fprintf(stderr, "SWAYSOCK not set\n");
-    exit(1);
-  }
-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   struct sockaddr_un addr = {.sun_family = AF_UNIX};
-  snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock);
-  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+  if (!sock || strlen(sock) >= sizeof(addr.sun_path)) {
+    fprintf(stderr, "SWAYSOCK missing or too long\n");
+    return -1;
+  }
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  if (fd < 0)
+    return -1;
+  memcpy(addr.sun_path, sock, strlen(sock) + 1);
+  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 &&
+      errno != EINPROGRESS) {
     perror("sway connect");
-    exit(1);
+    close(fd);
+    return -1;
   }
   return fd;
-}
-
-static void write_all(int fd, const void *buf, size_t len) {
-  const char *p = buf;
-  while (len) {
-    ssize_t n = write(fd, p, len);
-    if (n <= 0) {
-      perror("write");
-      exit(1);
-    }
-    p += n;
-    len -= n;
-  }
-}
-
-static void read_all(int fd, void *buf, size_t len) {
-  char *p = buf;
-  while (len) {
-    ssize_t n = read(fd, p, len);
-    if (n <= 0) {
-      perror("read");
-      exit(1);
-    }
-    p += n;
-    len -= n;
-  }
-}
-
-static void sway_send(int fd, uint32_t type, const char *payload) {
-  uint32_t len = payload ? (uint32_t)strlen(payload) : 0;
-  char hdr[14];
-  memcpy(hdr, "i3-ipc", 6);
-  memcpy(hdr + 6, &len, 4);
-  memcpy(hdr + 10, &type, 4);
-  write_all(fd, hdr, 14);
-  if (len)
-    write_all(fd, payload, len);
-}
-
-/* caller frees; type_out (optional) receives the message/event type */
-static char *sway_recv(int fd, uint32_t *type_out) {
-  char hdr[14];
-  uint32_t len;
-  read_all(fd, hdr, 14);
-  memcpy(&len, hdr + 6, 4);
-  if (type_out)
-    memcpy(type_out, hdr + 10, 4);
-  char *buf = malloc(len + 1);
-  read_all(fd, buf, len);
-  buf[len] = 0;
-  return buf;
 }
 
 /* ---------------- bar state ---------------- */
@@ -397,6 +346,7 @@ typedef struct {
   bool focused;
   bool urgent;
   char apps[MAX_APPS][64];
+  cairo_surface_t *icons[MAX_APPS];
   int app_count;
 } Workspace;
 
@@ -424,73 +374,64 @@ static void collect_apps(cJSON *node, Workspace *ws) {
   }
 }
 
-static cJSON *find_workspace(cJSON *node, const char *name) {
-  cJSON *type = cJSON_GetObjectItem(node, "type");
-  cJSON *nm = cJSON_GetObjectItem(node, "name");
-  if (cJSON_IsString(type) && !strcmp(type->valuestring, "workspace") &&
-      cJSON_IsString(nm) && !strcmp(nm->valuestring, name))
-    return node;
+static Workspace next_workspaces[MAX_WS];
+static int next_ws_count;
 
-  cJSON *arr = cJSON_GetObjectItem(node, "nodes");
-  cJSON *child;
-  cJSON_ArrayForEach(child, arr) {
-    cJSON *found = find_workspace(child, name);
-    if (found)
-      return found;
-  }
-  return NULL;
-}
-
-static void update_workspace_state(int cmd_fd) {
-  ws_count = 0;
-
-  /* all workspaces */
-  sway_send(cmd_fd, SWAY_GET_WORKSPACES, NULL);
-  char *reply = sway_recv(cmd_fd, NULL);
-  cJSON *wss = cJSON_Parse(reply);
-  free(reply);
-  if (!wss)
-    return;
-
+static bool parse_workspaces(cJSON *wss) {
+  if (!cJSON_IsArray(wss))
+    return false;
+  next_ws_count = 0;
+  memset(next_workspaces, 0, sizeof(next_workspaces));
   cJSON *ws;
   cJSON_ArrayForEach(ws, wss) {
-    if (ws_count >= MAX_WS)
+    if (next_ws_count >= MAX_WS)
       break;
-    Workspace *w = &workspaces[ws_count];
+    Workspace *w = &next_workspaces[next_ws_count++];
     cJSON *num = cJSON_GetObjectItem(ws, "num");
     cJSON *name = cJSON_GetObjectItem(ws, "name");
-    cJSON *focused = cJSON_GetObjectItem(ws, "focused");
-    cJSON *urgent = cJSON_GetObjectItem(ws, "urgent");
     w->num = cJSON_IsNumber(num) ? num->valueint : -1;
     snprintf(w->name, sizeof(w->name), "%s",
              cJSON_IsString(name) ? name->valuestring : "");
-    w->focused = cJSON_IsTrue(focused);
-    w->urgent = cJSON_IsTrue(urgent);
-    w->app_count = 0;
-    ws_count++;
+    w->focused = cJSON_IsTrue(cJSON_GetObjectItem(ws, "focused"));
+    w->urgent = cJSON_IsTrue(cJSON_GetObjectItem(ws, "urgent"));
   }
-  cJSON_Delete(wss);
-  if (ws_count == 0)
-    return;
+  return true;
+}
 
-  /* apps on each workspace, one tree query */
-  sway_send(cmd_fd, SWAY_GET_TREE, NULL);
-  reply = sway_recv(cmd_fd, NULL);
-  cJSON *tree = cJSON_Parse(reply);
-  free(reply);
-  if (!tree)
+/* Walk the tree once; workspace subtrees are consumed by collect_apps. */
+static void collect_workspaces(cJSON *node) {
+  cJSON *type = cJSON_GetObjectItem(node, "type");
+  cJSON *name = cJSON_GetObjectItem(node, "name");
+  if (cJSON_IsString(type) && !strcmp(type->valuestring, "workspace")) {
+    for (int i = 0; cJSON_IsString(name) && i < next_ws_count; i++)
+      if (!strcmp(name->valuestring, next_workspaces[i].name)) {
+        collect_apps(node, &next_workspaces[i]);
+        break;
+      }
     return;
-
-  for (int i = 0; i < ws_count; i++) {
-    cJSON *wsnode = find_workspace(tree, workspaces[i].name);
-    if (wsnode)
-      collect_apps(wsnode, &workspaces[i]);
   }
-  cJSON_Delete(tree);
+  cJSON *child;
+  cJSON_ArrayForEach(child, cJSON_GetObjectItem(node, "nodes"))
+      collect_workspaces(child);
+  cJSON_ArrayForEach(child, cJSON_GetObjectItem(node, "floating_nodes"))
+      collect_workspaces(child);
+}
+
+static void publish_workspaces(cJSON *tree) {
+  collect_workspaces(tree);
+  ++icon_generation;
+  for (int w = 0; w < next_ws_count; w++)
+    for (int a = 0; a < next_workspaces[w].app_count; a++)
+      next_workspaces[w].icons[a] = icon_get(next_workspaces[w].apps[a]);
+  memcpy(workspaces, next_workspaces, sizeof(workspaces));
+  ws_count = next_ws_count;
+  if (ram_cache)
+    g_hash_table_foreach_remove(ram_cache, icon_unused, NULL);
+  dirty = true;
 }
 
 /* ---------------- input: clickable workspaces ----------------
- * draw() records each pill's x-range; a left click hit-tests against them
+ * draw() records each workspace's x-range; a left click hit-tests against them
  * and switches workspace via sway IPC. */
 
 typedef struct {
@@ -518,10 +459,8 @@ static void ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
     return;
   for (int i = 0; i < ws_hit_count; i++) {
     if (pointer_x >= ws_hits[i].x0 && pointer_x < ws_hits[i].x1) {
-      char cmd[64];
-      snprintf(cmd, sizeof(cmd), "workspace number %d", ws_hits[i].num);
-      sway_send(sway_cmd_fd, SWAY_RUN_COMMAND, cmd);
-      free(sway_recv(sway_cmd_fd, NULL));
+      snprintf(pending_command, sizeof(pending_command), "workspace number %d",
+               ws_hits[i].num);
       break;
     }
   }
@@ -541,6 +480,10 @@ static void seat_capabilities(void *d, struct wl_seat *s, uint32_t caps) {
   if ((caps & WL_SEAT_CAPABILITY_POINTER) && !pointer) {
     pointer = wl_seat_get_pointer(s);
     wl_pointer_add_listener(pointer, &pointer_listener, NULL);
+  } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && pointer) {
+    wl_pointer_destroy(pointer);
+    pointer = NULL;
+    pointer_x = -1;
   }
 }
 static const struct wl_seat_listener seat_listener = {
@@ -549,7 +492,7 @@ static const struct wl_seat_listener seat_listener = {
 
 /* ---------------- right side stats ---------------- */
 
-/* IPv4 is cached and refreshed every 10th tick — getifaddrs() is a netlink
+/* IPv4 is cached and refreshed every ten seconds — getifaddrs() is a netlink
  * dump, too heavy to run every second for a value that rarely changes */
 static char ip_str[64];
 
@@ -594,19 +537,12 @@ static void get_ram(char *out, size_t len) {
 /* active keyboard layout via sway GET_INPUTS: "English (US)" -> EN,
  * "Bulgarian (phonetic)" -> BG; unknown languages get their first two
  * letters uppercased. Cached: only queried at startup and on input events. */
-static char lang_str[8];
+static char lang_str[8] = "??";
 
-static void refresh_lang(void) {
+static void refresh_lang(cJSON *inputs) {
   char *out = lang_str;
   size_t len = sizeof(lang_str);
   snprintf(out, len, "??");
-
-  sway_send(sway_cmd_fd, SWAY_GET_INPUTS, NULL);
-  char *reply = sway_recv(sway_cmd_fd, NULL);
-  cJSON *inputs = cJSON_Parse(reply);
-  free(reply);
-  if (!inputs)
-    return;
 
   cJSON *dev;
   cJSON_ArrayForEach(dev, inputs) {
@@ -622,10 +558,11 @@ static void refresh_lang(void) {
     else if (!strncmp(name, "Bulgarian", 9))
       snprintf(out, len, "BG");
     else if (name[0] && name[1])
-      snprintf(out, len, "%c%c", toupper(name[0]), toupper(name[1]));
+      snprintf(out, len, "%c%c", toupper((unsigned char)name[0]),
+               toupper((unsigned char)name[1]));
     break;
   }
-  cJSON_Delete(inputs);
+  dirty = true;
 }
 
 static int get_cpu_pct(void) {
@@ -655,37 +592,144 @@ static int get_cpu_pct(void) {
   return (int)(100 * (d_total - d_idle) / d_total);
 }
 
+static char ram[32], cpubuf[16] = "CPU ?", datebuf[16], timebuf[16];
+static void sample_status(bool prime) {
+  get_ram(ram, sizeof(ram));
+  int cpu = get_cpu_pct();
+  if (prime || cpu < 0)
+    snprintf(cpubuf, sizeof(cpubuf), "CPU ?");
+  else
+    snprintf(cpubuf, sizeof(cpubuf), "CPU %d%%", cpu);
+  time_t t = time(NULL);
+  struct tm tm;
+  localtime_r(&t, &tm);
+  strftime(datebuf, sizeof(datebuf), "%Y-%m-%d", &tm);
+  strftime(timebuf, sizeof(timebuf), "%H:%M:%S", &tm);
+  dirty = true;
+}
+
+static bool on_event(void *data, uint32_t type, const char *body) {
+  cJSON *event = cJSON_Parse(body);
+  if (!event)
+    return false;
+  if (type == SWAY_SUBSCRIBE) {
+    subscribed = cJSON_IsTrue(cJSON_GetObjectItem(event, "success"));
+    cJSON_Delete(event);
+    return subscribed;
+  }
+  if (!(type & 0x80000000u)) {
+    cJSON_Delete(event);
+    return false;
+  }
+  cJSON *change = cJSON_GetObjectItem(event, "change");
+  const char *what = cJSON_IsString(change) ? change->valuestring : "";
+  type &= 0x7fffffffu;
+  if (type == SWAY_EVT_INPUT) {
+    if (!strcmp(what, "xkb_layout") || !strcmp(what, "added") ||
+        !strcmp(what, "removed") || !strcmp(what, "xkb_keymap"))
+      want_lang = true;
+  } else if (type == 3) { /* window */
+    if (strcmp(what, "title") && strcmp(what, "focus") && strcmp(what, "mark"))
+      want_ws = true;
+  } else if (type == 0) { /* workspace */
+    want_ws = true;
+  }
+  cJSON_Delete(event);
+  return true;
+}
+
+static bool on_reply(void *data, uint32_t type, const char *body) {
+  cJSON *reply = cJSON_Parse(body);
+  if (!reply)
+    return false;
+  bool ok = true;
+  switch (type) {
+  case SWAY_GET_WORKSPACES:
+    ok = parse_workspaces(reply) &&
+         ipc_request(&command_ipc, SWAY_GET_TREE, NULL);
+    break;
+  case SWAY_GET_TREE:
+    ok = cJSON_IsObject(reply);
+    if (ok)
+      publish_workspaces(reply);
+    break;
+  case SWAY_GET_INPUTS:
+    ok = cJSON_IsArray(reply);
+    if (ok)
+      refresh_lang(reply);
+    break;
+  case SWAY_RUN_COMMAND: {
+    ok = cJSON_IsArray(reply);
+    cJSON *result;
+    cJSON_ArrayForEach(result, reply) if (!cJSON_IsTrue(cJSON_GetObjectItem(
+                                              result, "success")))
+        fprintf(stderr, "workspace command failed\n");
+    break;
+  }
+  default:
+    ok = false;
+  }
+  cJSON_Delete(reply);
+  return ok;
+}
+
+static bool schedule_query(void) {
+  if (!subscribed || command_ipc.pending)
+    return true;
+  if (*pending_command) {
+    bool ok = ipc_request(&command_ipc, SWAY_RUN_COMMAND, pending_command);
+    *pending_command = 0;
+    return ok;
+  }
+  if (want_lang) {
+    want_lang = false;
+    return ipc_request(&command_ipc, SWAY_GET_INPUTS, NULL);
+  }
+  if (want_ws) {
+    want_ws = false;
+    return ipc_request(&command_ipc, SWAY_GET_WORKSPACES, NULL);
+  }
+  return true;
+}
+
 /* ---------------- drawing ---------------- */
 
 #define MODULE_GAP                                                             \
   48 /* px between right-side modules (no separators, like eww) */
 
-/* built once in main() after the shm buffer exists; the buffer, width and
- * font never change, so no per-frame create/destroy */
-static cairo_t *cairo_ctx;
-static PangoLayout *pango_layout;
+static void frame_done(void *data, struct wl_callback *callback,
+                       uint32_t time) {
+  wl_callback_destroy(callback);
+  frame = NULL;
+}
+static const struct wl_callback_listener frame_listener = {.done = frame_done};
 
-static void draw(void) {
-  if (!configured || !cairo_ctx)
-    return;
+static bool draw(void) {
+  if (!configured || !dirty || frame)
+    return true;
+  BarBuffer *target = NULL;
+  for (int i = 0; i < 2; i++)
+    if (!buffers[i].busy) {
+      target = &buffers[i];
+      break;
+    }
+  if (!target)
+    return true;
+  if (!buffer_prepare(target, shm, bar_width, bar_height, FONT))
+    return false;
+  cairo_t *cr = target->cr;
+  PangoLayout *layout = target->layout;
 
-  maybe_reload_theme();
-
-  cairo_t *cr = cairo_ctx;
-  PangoLayout *layout = pango_layout;
-
-  /* background: SOURCE so the translucent base replaces the old frame
-   * instead of blending with it */
+  /* Replace the previous frame with the terminal background. */
   cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-  cairo_set_source_rgba(cr, th_bg.r, th_bg.g, th_bg.b, th_bg_alpha);
+  cairo_set_source_rgb(cr, bar_bg.r, bar_bg.g, bar_bg.b);
   cairo_paint(cr);
   cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 
   int tw, th;
 
-  /* ---- left: every workspace as an eww-style pill: number + icons.
-   * Focused gets an accent background, urgent a red one (like eww.scss).
-   * Geometry mirrors eww: padding 2px 10px, icon spacing 3, gap 6. ---- */
+  /* ---- left: workspace numbers + icons; only the active number is white.
+   * Padding 2px 10px, icon spacing 3, gap 6. ---- */
   int x = 10;
   ws_hit_count = 0;
   for (int w = 0; w < ws_count; w++) {
@@ -695,13 +739,8 @@ static void draw(void) {
     pango_layout_set_text(layout, wsbuf, -1);
     pango_layout_get_pixel_size(layout, &tw, &th);
 
-    cairo_surface_t *icons[MAX_APPS];
-    int n_icons = 0;
-    for (int a = 0; a < ws->app_count; a++) {
-      cairo_surface_t *icon = icon_get(ws->apps[a]);
-      if (icon && cairo_image_surface_get_width(icon) > 0)
-        icons[n_icons++] = icon;
-    }
+    cairo_surface_t **icons = ws->icons;
+    int n_icons = ws->app_count;
     int content_w = tw + n_icons * (ICON_SIZE + 3);
 
     ws_hits[ws_hit_count++] = (WsHit){
@@ -710,26 +749,16 @@ static void draw(void) {
         .num = ws->num,
     };
 
-    if (ws->focused || ws->urgent) {
-      Color *bg = ws->urgent ? &th_urgent_bg : &th_focused_bg;
-      cairo_set_source_rgb(cr, bg->r, bg->g, bg->b);
-      cairo_rectangle(cr, x, 4, content_w + 20, BAR_HEIGHT - 8);
-      cairo_fill(cr);
-    }
-
-    Color *numc = (ws->focused || ws->urgent) ? &th_focused_fg : &th_ws_num;
+    const Color *numc = ws->focused ? &bar_fg : &ws_inactive_fg;
     cairo_set_source_rgb(cr, numc->r, numc->g, numc->b);
-    cairo_move_to(cr, x + 10, (BAR_HEIGHT - th) / 2.0);
+    cairo_move_to(cr, x + 10, ((int)bar_height - th) / 2.0);
     pango_cairo_show_layout(cr, layout);
 
     int ix = x + 10 + tw + 3;
     for (int a = 0; a < n_icons; a++) {
-      int iw = cairo_image_surface_get_width(icons[a]);
-      double scale = (double)ICON_SIZE / iw;
       cairo_save(cr);
-      cairo_translate(cr, ix, (BAR_HEIGHT - ICON_SIZE) / 2.0);
-      cairo_scale(cr, scale, scale);
-      cairo_set_source_surface(cr, icons[a], 0, 0);
+      cairo_set_source_surface(cr, icons[a], ix,
+                               ((int)bar_height - ICON_SIZE) / 2.0);
       cairo_paint(cr);
       cairo_restore(cr);
       ix += ICON_SIZE + 3;
@@ -740,44 +769,37 @@ static void draw(void) {
 
   /* ---- right: modules drawn right-to-left with a fixed pixel gap ----
    * ip_str and lang_str are cached globals, refreshed outside draw() */
-  char ram[32], cpubuf[16], datebuf[16], timebuf[16];
-  get_ram(ram, sizeof(ram));
-  int cpu = get_cpu_pct();
-  snprintf(cpubuf, sizeof(cpubuf), "CPU %d%%", cpu < 0 ? 0 : cpu);
-
-  time_t t = time(NULL);
-  struct tm *tm = localtime(&t);
-  strftime(datebuf, sizeof(datebuf), "%Y-%m-%d", tm);
-  strftime(timebuf, sizeof(timebuf), "%H:%M:%S", tm);
-
   const char *modules[] = {cpubuf, ram, ip_str, datebuf, timebuf, lang_str};
   int n_modules = sizeof(modules) / sizeof(modules[0]);
 
-  cairo_set_source_rgb(cr, th_fg.r, th_fg.g, th_fg.b);
+  cairo_set_source_rgb(cr, bar_fg.r, bar_fg.g, bar_fg.b);
   int rx = bar_width - 10;
   for (int m = n_modules - 1; m >= 0; m--) {
     pango_layout_set_text(layout, modules[m], -1);
     pango_layout_get_pixel_size(layout, &tw, &th);
     rx -= tw;
-    cairo_move_to(cr, rx, (BAR_HEIGHT - th) / 2.0);
+    cairo_move_to(cr, rx, ((int)bar_height - th) / 2.0);
     pango_cairo_show_layout(cr, layout);
     rx -= MODULE_GAP;
   }
 
-  wl_surface_attach(surface, buffer, 0, 0);
-  wl_surface_damage_buffer(surface, 0, 0, bar_width, BAR_HEIGHT);
+  cairo_surface_flush(cairo_get_target(cr));
+  wl_surface_attach(surface, target->buffer, 0, 0);
+  if (wl_surface_get_version(surface) >= 4)
+    wl_surface_damage_buffer(surface, 0, 0, bar_width, bar_height);
+  else
+    wl_surface_damage(surface, 0, 0, bar_width, bar_height);
+  frame = wl_surface_frame(surface);
+  wl_callback_add_listener(frame, &frame_listener, NULL);
+  target->busy = true;
   wl_surface_commit(surface);
-  wl_display_flush(display);
+  dirty = false;
+  return true;
 }
 
 /* ---------------- main ---------------- */
 
 int main(void) {
-  const char *home = getenv("HOME");
-  snprintf(theme_path, sizeof(theme_path), "%s/.config/bar/theme.conf",
-           home ? home : "");
-  load_theme();
-
   /* wayland setup */
   display = wl_display_connect(NULL);
   if (!display) {
@@ -786,7 +808,11 @@ int main(void) {
   }
   struct wl_registry *registry = wl_display_get_registry(display);
   wl_registry_add_listener(registry, &registry_listener, NULL);
-  wl_display_roundtrip(display);
+  if (wl_display_roundtrip(display) < 0) {
+    fprintf(stderr, "Wayland registry discovery failed\n");
+    wl_display_disconnect(display);
+    return 1;
+  }
 
   if (!compositor || !shm || !layer_shell) {
     fprintf(stderr,
@@ -809,104 +835,117 @@ int main(void) {
   zwlr_layer_surface_v1_set_exclusive_zone(layer_surface, BAR_HEIGHT);
   wl_surface_commit(surface);
 
-  while (!configured)
-    wl_display_dispatch(display);
-
-  if (bar_width == 0)
-    bar_width = 1920;
-
-  /* shm buffer */
-  int stride = bar_width * 4;
-  int size = stride * BAR_HEIGHT;
-  int fd = memfd_create("bar", 0);
-  if (ftruncate(fd, size) < 0) {
-    perror("ftruncate");
+  command_ipc.fd = sway_connect();
+  event_ipc.fd = sway_connect();
+  if (command_ipc.fd < 0 || event_ipc.fd < 0 ||
+      !ipc_request(&event_ipc, SWAY_SUBSCRIBE,
+                   "[\"window\",\"workspace\",\"input\"]"))
     return 1;
-  }
-  shm_data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, size);
-  buffer = wl_shm_pool_create_buffer(pool, 0, bar_width, BAR_HEIGHT, stride,
-                                     WL_SHM_FORMAT_ARGB8888);
-  wl_shm_pool_destroy(pool);
-  close(fd);
 
-  /* persistent cairo/pango state over the shm buffer */
-  cairo_surface_t *cs = cairo_image_surface_create_for_data(
-      shm_data, CAIRO_FORMAT_ARGB32, bar_width, BAR_HEIGHT, stride);
-  cairo_ctx = cairo_create(cs);
-  pango_layout = pango_cairo_create_layout(cairo_ctx);
-  PangoFontDescription *font = pango_font_description_from_string(FONT);
-  pango_layout_set_font_description(pango_layout, font);
-  pango_font_description_free(font);
-
-  /* sway: one socket for queries/commands, one subscribed to events */
-  int cmd_fd = sway_cmd_fd = sway_connect();
-  int evt_fd = sway_connect();
-  sway_send(evt_fd, SWAY_SUBSCRIBE, "[\"window\",\"workspace\",\"input\"]");
-  free(sway_recv(evt_fd, NULL)); /* {"success": true} */
-
-  /* 1s timer */
-  int timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
+  int timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
   struct itimerspec ts = {
       .it_interval = {.tv_sec = 1},
       .it_value = {.tv_sec = 1},
   };
-  timerfd_settime(timer_fd, 0, &ts, NULL);
-
-  get_cpu_pct(); /* prime the cpu delta */
+  if (timer_fd < 0 || timerfd_settime(timer_fd, 0, &ts, NULL) < 0) {
+    perror("timerfd");
+    return 1;
+  }
+  sample_status(true);
   refresh_ipv4();
-  refresh_lang();
-  update_workspace_state(cmd_fd);
-  draw();
-
-  struct pollfd fds[] = {
-      {.fd = wl_display_get_fd(display), .events = POLLIN},
-      {.fd = evt_fd, .events = POLLIN},
-      {.fd = timer_fd, .events = POLLIN},
-  };
-
-  unsigned tick = 0;
-  for (;;) {
-    wl_display_flush(display);
-    if (poll(fds, 3, -1) < 0) {
+  int64_t next_ip = monotonic_ms() + 10000;
+  int result = 0;
+  while (running) {
+    if (wl_display_dispatch_pending(display) < 0 || !schedule_query() ||
+        !draw())
+      goto failed;
+    if (!running)
+      break;
+    while (wl_display_prepare_read(display) != 0)
+      if (wl_display_dispatch_pending(display) < 0)
+        goto failed;
+    int flushed = wl_display_flush(display);
+    if (flushed < 0 && errno != EAGAIN) {
+      wl_display_cancel_read(display);
+      goto failed;
+    }
+    struct pollfd fds[] = {
+        {.fd = wl_display_get_fd(display),
+         .events = POLLIN | (flushed < 0 ? POLLOUT : 0)},
+        {.fd = event_ipc.fd,
+         .events = POLLIN | (event_ipc.tx_size ? POLLOUT : 0)},
+        {.fd = command_ipc.fd,
+         .events = POLLIN | (command_ipc.tx_size ? POLLOUT : 0)},
+        {.fd = timer_fd, .events = POLLIN},
+    };
+    int ready = poll(fds, 4, -1);
+    if (ready < 0) {
+      wl_display_cancel_read(display);
       if (errno == EINTR)
         continue;
-      break;
+      goto failed;
     }
-
     if (fds[0].revents & POLLIN) {
-      if (wl_display_dispatch(display) < 0)
-        break;
+      if (wl_display_read_events(display) < 0)
+        goto failed;
+    } else {
+      wl_display_cancel_read(display);
     }
-
-    if (fds[1].revents & POLLIN) {
-      /* drain every queued event first so a burst costs one re-query
-       * and one redraw, not one per event */
-      bool want_ws = false, want_lang = false;
-      struct pollfd pf = {.fd = evt_fd, .events = POLLIN};
-      do {
-        uint32_t type;
-        free(sway_recv(evt_fd, &type)); /* content doesn't matter */
-        if ((type & 0x7fffffff) == SWAY_EVT_INPUT)
-          want_lang = true;
-        else
-          want_ws = true;
-      } while (poll(&pf, 1, 0) > 0 && (pf.revents & POLLIN));
-      if (want_ws)
-        update_workspace_state(cmd_fd); /* just re-query, simplest + robust */
-      if (want_lang)
-        refresh_lang();
-      draw();
-    }
-
-    if (fds[2].revents & POLLIN) {
+    for (int i = 0; i < 4; i++)
+      if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL))
+        goto failed;
+    if (wl_display_dispatch_pending(display) < 0)
+      goto failed;
+    if (!running)
+      break;
+    if ((fds[1].revents & POLLOUT) && !ipc_write(&event_ipc))
+      goto failed;
+    if ((fds[2].revents & POLLOUT) && !ipc_write(&command_ipc))
+      goto failed;
+    if ((fds[1].revents & POLLIN) && !ipc_read(&event_ipc, on_event, NULL))
+      goto failed;
+    if ((fds[2].revents & POLLIN) && !ipc_read(&command_ipc, on_reply, NULL))
+      goto failed;
+    if (fds[3].revents & POLLIN) {
       uint64_t ticks;
-      if (read(timer_fd, &ticks, 8) != 8) {
+      if (read(timer_fd, &ticks, sizeof(ticks)) == sizeof(ticks)) {
+        sample_status(false);
+        if (monotonic_ms() >= next_ip) {
+          refresh_ipv4();
+          next_ip = monotonic_ms() + 10000;
+        }
       }
-      if (++tick % 10 == 0)
-        refresh_ipv4();
-      draw();
+    }
+    if (ipc_expired(&command_ipc) || ipc_expired(&event_ipc)) {
+      fprintf(stderr, "Sway IPC request timed out\n");
+      goto failed;
     }
   }
-  return 0;
+  goto cleanup;
+failed:
+  fprintf(stderr,
+          "bar: display/IPC disconnected or invalid response/resource\n");
+  result = 1;
+cleanup:
+  ipc_close(&command_ipc);
+  ipc_close(&event_ipc);
+  close(timer_fd);
+  if (frame)
+    wl_callback_destroy(frame);
+  for (int i = 0; i < 2; i++)
+    buffer_destroy(&buffers[i]);
+  if (ram_cache)
+    g_hash_table_destroy(ram_cache);
+  if (pointer)
+    wl_pointer_destroy(pointer);
+  if (seat)
+    wl_seat_destroy(seat);
+  zwlr_layer_surface_v1_destroy(layer_surface);
+  wl_surface_destroy(surface);
+  zwlr_layer_shell_v1_destroy(layer_shell);
+  wl_shm_destroy(shm);
+  wl_compositor_destroy(compositor);
+  wl_registry_destroy(registry);
+  wl_display_disconnect(display);
+  return result;
 }
