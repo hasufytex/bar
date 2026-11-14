@@ -38,7 +38,7 @@ xdg-shell-protocol.c: $(wildcard $(XDG_XML))
 install: bar
 	install -Dm755 bar $(PREFIX)/bin/bar
 
-check: check-ipc check-state $(PROTO_SRC) $(PROTO_HDR)
+check: check-ipc check-state check-scratchpad $(PROTO_SRC) $(PROTO_HDR)
 	@set -eu; test_bin=$$(mktemp /tmp/bar-icons-test.XXXXXX); \
 	trap 'rm -f "$$test_bin"' EXIT; \
 	$(CC) $(CFLAGS) -I. -o "$$test_bin" tests/icons.c ipc.c buffers.c $(PROTO_SRC) $(LIBS); \
@@ -57,10 +57,16 @@ check-state: $(PROTO_SRC) $(PROTO_HDR)
 	$(CC) $(CFLAGS) -I. -o "$$test_bin" tests/state.c ipc.c buffers.c $(PROTO_SRC) $(LIBS); \
 	"$$test_bin"
 
+check-scratchpad: $(PROTO_SRC) $(PROTO_HDR)
+	@set -eu; test_bin=$$(mktemp /tmp/bar-scratchpad-test.XXXXXX); \
+	trap 'rm -f "$$test_bin"' EXIT; \
+	$(CC) $(CFLAGS) -I. -o "$$test_bin" tests/scratchpad.c ipc.c buffers.c $(PROTO_SRC) $(LIBS); \
+	"$$test_bin"
+
 check-integration: bar
 	python3 tests/integration.py
 
 clean:
 	rm -f bar $(PROTO_SRC) $(PROTO_HDR)
 
-.PHONY: install check check-ipc check-state check-integration clean
+.PHONY: install check check-ipc check-state check-scratchpad check-integration clean

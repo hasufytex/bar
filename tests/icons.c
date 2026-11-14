@@ -20,14 +20,40 @@ static void expect_icon(const char *app_id, const char *expected) {
   assert(!strcmp(icon, expected));
 }
 
+static void fixture(const char *path, const char *contents) {
+  char *dir = g_path_get_dirname(path);
+  assert(g_mkdir_with_parents(dir, 0700) == 0);
+  assert(g_file_set_contents(path, contents, -1, NULL));
+  g_free(dir);
+}
+
+static void remove_tree(const char *path) {
+  if (g_file_test(path, G_FILE_TEST_IS_DIR)) {
+    GDir *dir = g_dir_open(path, 0, NULL);
+    const char *name;
+    while ((name = g_dir_read_name(dir))) {
+      char *child = g_build_filename(path, name, NULL);
+      remove_tree(child);
+      g_free(child);
+    }
+    g_dir_close(dir);
+    assert(g_rmdir(path) == 0);
+  } else {
+    assert(g_remove(path) == 0);
+  }
+}
+
 int main(int argc, char **argv) {
   /* Optional smoke check against the installed desktop entries and icons. */
-  if (argc == 3) {
-    expect_icon(argv[1], argv[2]);
-    cairo_surface_t *s = icon_lookup(argv[1]);
-    assert(s && cairo_surface_status(s) == CAIRO_STATUS_SUCCESS);
-    cairo_surface_destroy(s);
-    puts("Installed app icon resolved and loaded.");
+  if (argc > 1) {
+    assert(argc % 2 == 1);
+    for (int i = 1; i < argc; i += 2) {
+      expect_icon(argv[i], argv[i + 1]);
+      cairo_surface_t *s = icon_lookup(argv[i]);
+      assert(s && cairo_surface_status(s) == CAIRO_STATUS_SUCCESS);
+      cairo_surface_destroy(s);
+      printf("Installed app icon resolved and loaded: %s\n", argv[i]);
+    }
     return 0;
   }
 
@@ -41,6 +67,10 @@ int main(int argc, char **argv) {
   assert(g_mkdir_with_parents(system_apps, 0700) == 0);
   g_setenv("XDG_DATA_HOME", user, TRUE);
   g_setenv("XDG_DATA_DIRS", system, TRUE);
+  char *config = g_build_filename(tmp, "config", NULL);
+  g_setenv("XDG_CONFIG_HOME", config, TRUE);
+  char *settings = g_build_filename(config, "gtk-3.0", "settings.ini", NULL);
+  fixture(settings, "[Settings]\ngtk-icon-theme-name=TestTheme\n");
 
   entry(system, "direct.desktop", "Icon=system-icon\n");
   entry(user, "direct.desktop", "Icon=user-icon\n");
@@ -51,6 +81,16 @@ int main(int argc, char **argv) {
   entry(system, "action-only.desktop",
         "Actions=New;\n[Desktop Action New]\nName=New\nIcon=wrong-action\n");
   entry(system, "broken.desktop", "Icon=/nonexistent/bar-test.png\n");
+  entry(user, "unityhub.desktop", "Icon=unity-test-logo\n");
+  entry(system, "firefox-bin.desktop",
+        "StartupWMClass=firefox\nIcon=firefox-test-logo\n");
+  entry(system, "thunderbird-bin.desktop",
+        "StartupWMClass=thunderbird\nIcon=thunderbird-test-logo\n");
+  entry(system, "collision-a.desktop", "Icon=wrong-a\n");
+  entry(system, "collision_a.desktop", "Icon=wrong-b\n");
+  entry(system, "inherited.desktop", "Icon=inherited-test-logo\n");
+  entry(system, "pixmap.desktop", "Icon=pixmap-test-logo\n");
+  entry(system, "override.desktop", "Icon=override-test-logo\n");
 
   char *png = g_build_filename(tmp, "icon.png", NULL);
   cairo_surface_t *source = generic_app_icon();
@@ -70,17 +110,70 @@ int main(int argc, char **argv) {
   entry(system, "svg.desktop", fields);
   g_free(fields);
 
+  const char *red_svg =
+      "<svg xmlns='http://www.w3.org/2000/svg' width='22' height='22'>"
+      "<rect width='22' height='22' fill='red'/></svg>";
+  char *path = g_build_filename(user, "icons", "hicolor", "256x256", "apps",
+                                "unity-test-logo.svg", NULL);
+  fixture(path, red_svg);
+  g_free(path);
+  path = g_build_filename(system, "icons", "TestTheme", "index.theme", NULL);
+  fixture(path, "[Icon Theme]\nName=Test\nDirectories=large/apps,custom/categories\n"
+                "Inherits=TestParent\n[large/apps]\nSize=128\nType=Fixed\n"
+                "[custom/categories]\nSize=22\nType=Fixed\n");
+  g_free(path);
+  path = g_build_filename(system, "icons", "TestParent", "index.theme", NULL);
+  fixture(path, "[Icon Theme]\nName=Parent\nDirectories=custom/apps\n"
+                "Inherits=TestTheme\n[custom/apps]\nSize=22\nType=Fixed\n");
+  g_free(path);
+  path = g_build_filename(user, "icons", "TestParent", "custom", "apps",
+                          "inherited-test-logo.svg", NULL);
+  fixture(path, red_svg);
+  g_free(path);
+  path = g_build_filename(user, "icons", "TestTheme", "custom", "categories",
+                          "override-test-logo.svg", NULL);
+  fixture(path, red_svg);
+  g_free(path);
+  const char *blue_svg =
+      "<svg xmlns='http://www.w3.org/2000/svg' width='22' height='22'>"
+      "<rect width='22' height='22' fill='blue'/></svg>";
+  path = g_build_filename(system, "icons", "TestTheme", "custom", "categories",
+                          "override-test-logo.svg", NULL);
+  fixture(path, blue_svg);
+  g_free(path);
+  path = g_build_filename(user, "icons", "TestTheme", "large", "apps",
+                          "override-test-logo.svg", NULL);
+  fixture(path, blue_svg);
+  g_free(path);
+  path = g_build_filename(system, "pixmaps", "pixmap-test-logo.svg", NULL);
+  fixture(path, red_svg);
+  g_free(path);
+
   expect_icon("direct", "user-icon");
+  expect_icon("direct.desktop", "user-icon");
   expect_icon("browser", "browser-logo");
+  expect_icon("unity-hub", "unity-test-logo");
+  expect_icon("Unity-Hub", "unity-test-logo");
+  expect_icon("Firefox", "firefox-test-logo");
+  expect_icon("Thunderbird", "thunderbird-test-logo");
+  expect_icon("FIREFOX-BIN", "firefox-test-logo");
+  expect_icon("collision a", "collision a"); /* Ambiguous relaxed match. */
   expect_icon("action-only", "action-only");
   expect_icon("unknown-bar-test", "unknown-bar-test");
-  const char *formats[] = {"png", "svg"};
+  const char *formats[] = {"png", "svg", "unity-hub", "inherited", "pixmap"};
   for (size_t i = 0; i < G_N_ELEMENTS(formats); i++) {
     cairo_surface_t *s = icon_lookup(formats[i]);
     assert(s && cairo_surface_status(s) == CAIRO_STATUS_SUCCESS);
     assert(cairo_image_surface_get_width(s) == ICON_SIZE);
     cairo_surface_destroy(s);
   }
+  source = icon_lookup("override");
+  assert(source);
+  cairo_surface_flush(source);
+  uint32_t *center = (uint32_t *)(cairo_image_surface_get_data(source) +
+                      (ICON_SIZE / 2) * cairo_image_surface_get_stride(source));
+  assert(center[ICON_SIZE / 2] == 0xffff0000u); /* Closest size, user override. */
+  cairo_surface_destroy(source);
   assert(icon_lookup("broken") == NULL);
   cairo_surface_t *fallback = icon_get("broken");
   assert(fallback && cairo_surface_status(fallback) == CAIRO_STATUS_SUCCESS);
@@ -124,23 +217,9 @@ int main(int argc, char **argv) {
   assert(row[ICON_SIZE / 2] == 0xffff0000u);
   cairo_surface_destroy(source);
 
-  const char *dirs[] = {user_apps, system_apps};
-  for (size_t i = 0; i < G_N_ELEMENTS(dirs); i++) {
-    GDir *dir = g_dir_open(dirs[i], 0, NULL);
-    const char *name;
-    while ((name = g_dir_read_name(dir))) {
-      char *path = g_build_filename(dirs[i], name, NULL);
-      g_remove(path);
-      g_free(path);
-    }
-    g_dir_close(dir);
-    g_rmdir(dirs[i]);
-  }
-  g_remove(png);
-  g_remove(svg);
-  g_rmdir(user);
-  g_rmdir(system);
-  g_rmdir(tmp);
+  remove_tree(tmp);
+  g_free(settings);
+  g_free(config);
   g_free(png);
   g_free(svg);
   g_free(user_apps);
