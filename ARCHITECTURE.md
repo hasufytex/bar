@@ -8,9 +8,11 @@ Follow-up implementation: the five priorities summarized with this review are
 now implemented: release-tracked resizeable buffers (`buffers.c`), timer-based
 status snapshots, window event filtering with single-pass tree collection,
 nonblocking Sway IPC (`ipc.c`), and retention/rasterization of visible icons.
-The analysis below records the pre-change architecture. Output scaling,
-width-aware layout, expanded icon-theme lookup, and dynamic workspace limits
-remain separate follow-up work.
+The analysis below records the pre-change architecture. Expanded XDG/icon-theme
+lookup, named-workspace clicks, and event-driven scratchpad icon toggles have
+also since been implemented. Output scaling, width-aware layout, and dynamic
+workspace limits remain separate follow-up work. See README.md for current
+behavior, dependencies, and checks; the measurements below are historical.
 
 ## Assessment
 
