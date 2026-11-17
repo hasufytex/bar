@@ -6,13 +6,13 @@
 
 #define IPC_MAX_PAYLOAD (16u * 1024u * 1024u)
 typedef struct {
-  int fd;
-  unsigned char header[14];
-  size_t header_used, body_used, tx_used, tx_size;
-  uint32_t body_size, type, expected;
-  char *body, *tx;
-  bool pending;
-  int64_t deadline;
+	int fd;
+	unsigned char header[14];
+	size_t header_used, body_used, tx_used, tx_size;
+	uint32_t body_size, type, expected;
+	char *body, *tx;
+	bool pending;
+	int64_t deadline;
 } Ipc;
 
 typedef bool (*IpcMessage)(void *, uint32_t, const char *);

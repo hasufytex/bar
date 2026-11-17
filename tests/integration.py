@@ -55,7 +55,7 @@ def run():
             )
             with (root / "bar.log").open("w") as log:
                 bar = subprocess.Popen(
-                    [os.environ.get("BAR_TEST_BINARY", "./bar")],
+                    [os.environ.get("BAR_TEST_BINARY", "./build/bar")],
                     env=env, stdout=log, stderr=log,
                 )
             time.sleep(1.25)
