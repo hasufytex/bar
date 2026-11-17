@@ -9,7 +9,8 @@ IPv4 address, date, time, and keyboard layout on the right.
 - GCC, GNU Make, `pkg-config`, and `wayland-scanner`.
 - Development libraries for these pkg-config modules:
   `wayland-client cairo pango pangocairo libcjson librsvg-2.0 gio-unix-2.0`.
-- Protocol XML files from `wayland-protocols` and `wlr-protocols`.
+- The xdg-shell protocol XML from `wayland-protocols`. The layer-shell XML
+  from `wlr-protocols` is vendored in `protocols/`.
 - Sway and the Liberation Mono font for running the bar.
 
 ## Building
@@ -22,9 +23,13 @@ The executable and generated Wayland bindings are written to `build/`.
 The default protocol locations are:
 
 ```text
-WLR_XML=/usr/share/wlr-protocols/unstable/wlr-layer-shell-unstable-v1.xml
+WLR_XML=protocols/wlr-layer-shell-unstable-v1.xml
 XDG_XML=/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
 ```
+
+`protocols/wlr-layer-shell-unstable-v1.xml` is copied unchanged from
+[wlr-protocols](https://gitlab.freedesktop.org/wlroots/wlr-protocols)
+(version 5, MIT license).
 
 Override either path when necessary:
 
@@ -32,8 +37,7 @@ Override either path when necessary:
 make WLR_XML=/path/to/wlr-layer-shell-unstable-v1.xml XDG_XML=/path/to/xdg-shell.xml
 ```
 
-`make clean` removes the executable and generated bindings. Rebuilding afterward
-requires both protocol XML files.
+`make clean` removes the executable and generated bindings.
 
 ## Running
 

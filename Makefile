@@ -1,5 +1,5 @@
-# Arch: install wlr-protocols (AUR) or adjust WLR_XML to wherever the xml lives
-WLR_XML ?= /usr/share/wlr-protocols/unstable/wlr-layer-shell-unstable-v1.xml
+# Layer shell XML is vendored from wlr-protocols (not packaged on every distro).
+WLR_XML ?= protocols/wlr-layer-shell-unstable-v1.xml
 XDG_XML ?= /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
 
 PREFIX ?= $(HOME)/.local
